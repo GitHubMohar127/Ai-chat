@@ -74,16 +74,13 @@ def clean_document_link(value):
 
         return None
 
-
     value = str(
         value
     ).strip()
 
-
     if not value:
 
         return None
-
 
     unavailable_values = {
         "nan",
@@ -100,11 +97,9 @@ def clean_document_link(value):
         "msds unavailable"
     }
 
-
     if value.lower() in unavailable_values:
 
         return None
-
 
     if not (
         value.lower().startswith(
@@ -117,7 +112,6 @@ def clean_document_link(value):
     ):
 
         return None
-
 
     return value
 
@@ -133,9 +127,7 @@ def display_message(message):
         "assistant"
     )
 
-
     with st.chat_message(role):
-
 
         # ====================================================
         # USER MESSAGE
@@ -188,21 +180,17 @@ def display_message(message):
                 "Product"
             )
 
-
             tds_link = message.get(
                 "tds_link"
             )
-
 
             msds_link = message.get(
                 "msds_link"
             )
 
-
             st.markdown(
                 f"**📦 {product_name}**"
             )
-
 
             col1, col2 = st.columns(
                 2
@@ -264,21 +252,126 @@ def display_message(message):
                 )
             )
 
-
             products = message.get(
                 "products",
                 []
             )
 
+            # ------------------------------------------------
+            # CREATE CLICKABLE PRODUCT BUTTONS
+            # ------------------------------------------------
 
             for index, product_name in enumerate(
                 products,
                 start=1
             ):
 
-                st.markdown(
-                    f"**{index}. {product_name}**"
-                )
+                if st.button(
+                    f"{index}. {product_name}",
+                    key=f"product_select_{message.get('id', 'msg')}_{index}",
+                    use_container_width=True
+                ):
+
+                    # ----------------------------------------
+                    # Search the selected product directly
+                    # No Gemini call is required here.
+                    # ----------------------------------------
+
+                    selected_matches = search_products(
+                        df,
+                        product_name
+                    )
+
+
+                    # ----------------------------------------
+                    # If exactly one product is found
+                    # ----------------------------------------
+
+                    if len(selected_matches) == 1:
+
+                        selected_product = (
+                            selected_matches.iloc[0]
+                        )
+
+                        selected_product_name = str(
+                            selected_product.get(
+                                "Product_Name",
+                                product_name
+                            )
+                        ).strip()
+
+                        selected_tds_link = (
+                            clean_document_link(
+                                selected_product.get(
+                                    "TDS_Link"
+                                )
+                            )
+                        )
+
+                        selected_msds_link = (
+                            clean_document_link(
+                                selected_product.get(
+                                    "MSDS_Link"
+                                )
+                            )
+                        )
+
+
+                        # ------------------------------------
+                        # Add selected product as user message
+                        # ------------------------------------
+
+                        st.session_state.messages.append(
+                            {
+                                "role": "user",
+                                "type": "text",
+                                "content": selected_product_name
+                            }
+                        )
+
+
+                        # ------------------------------------
+                        # Add product result
+                        # ------------------------------------
+
+                        st.session_state.messages.append(
+                            {
+                                "role": "assistant",
+                                "type": "product",
+                                "product_name": selected_product_name,
+                                "tds_link": selected_tds_link,
+                                "msds_link": selected_msds_link
+                            }
+                        )
+
+
+                        # ------------------------------------
+                        # Refresh the application
+                        # ------------------------------------
+
+                        st.rerun()
+
+
+                    # ----------------------------------------
+                    # Safety fallback
+                    # ----------------------------------------
+
+                    else:
+
+                        st.session_state.messages.append(
+                            {
+                                "role": "assistant",
+                                "type": "text",
+                                "content": (
+                                    "Sorry, I could not uniquely "
+                                    "identify that product. "
+                                    "Please try searching for the "
+                                    "full product name."
+                                )
+                            }
+                        )
+
+                        st.rerun()
 
 
 # ============================================================
@@ -346,7 +439,6 @@ if user_message:
             }
         )
 
-
         st.rerun()
 
 
@@ -356,7 +448,6 @@ if user_message:
     # ========================================================
 
     if ai_response["type"] == "product_search":
-
 
         # ----------------------------------------------------
         # Gemini extracted the actual product search text.
@@ -374,7 +465,6 @@ if user_message:
             "search_query",
             user_message
         )
-
 
         if not search_query:
 
@@ -468,6 +558,18 @@ if user_message:
                 )
 
 
+                # ---------------------------------------------
+                # Give this message a unique ID.
+                #
+                # This prevents Streamlit button-key
+                # conflicts if multiple result messages exist.
+                # ---------------------------------------------
+
+                message_id = (
+                    f"multiple_{len(st.session_state.messages)}"
+                )
+
+
                 st.session_state.messages.append(
                     {
                         "role": "assistant",
@@ -477,12 +579,18 @@ if user_message:
                             "Please specify the product name from "
                             "the list below."
                         ),
-                        "products": product_names
+                        "products": product_names,
+                        "id": message_id
                     }
                 )
 
 
         except Exception as error:
+
+            print(
+                "Product search error:",
+                error
+            )
 
             st.session_state.messages.append(
                 {

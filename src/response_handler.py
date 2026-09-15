@@ -1,5 +1,6 @@
 import os
 import json
+import re
 
 from google import genai
 from google.genai import types
@@ -10,15 +11,187 @@ from google.genai import types
 # ============================================================
 
 def get_ai_client():
+    """
+    Create and return the Gemini client.
+
+    The API key is read from the environment variable:
+
+        GEMINI_API_KEY
+
+    If the API key is not available, None is returned.
+    """
 
     api_key = os.getenv("GEMINI_API_KEY")
 
     if not api_key:
         return None
 
-    return genai.Client(
-        api_key=api_key
+    return genai.Client(api_key=api_key)
+
+
+# ============================================================
+# BASIC TEXT HELPERS
+# ============================================================
+
+def normalize_message(message):
+    """
+    Normalize a user's message for simple local checks.
+
+    Examples:
+
+        " VMA "      -> "vma"
+        "Powdar"     -> "powdar"
+        "HIND"       -> "hind"
+        "Hello!!!"   -> "hello"
+    """
+
+    if not isinstance(message, str):
+        return ""
+
+    message = message.lower().strip()
+
+    # Remove extra spaces
+    message = re.sub(r"\s+", " ", message)
+
+    return message
+
+
+def is_simple_product_candidate(message):
+    """
+    Decide whether a short/simple user message should be treated
+    as a possible product search BEFORE asking Gemini.
+
+    This is the important fix for cases such as:
+
+        VMA
+        vma
+        powder
+        powdar
+        plast
+        crystel
+        seal
+        hind
+        sca
+        wp
+
+    We do NOT assume that the word is actually a valid product.
+
+    We only say:
+
+        "This looks like a possible product search."
+
+    Python will later check the Excel dataset.
+
+    This prevents Gemini from incorrectly saying:
+
+        invalid
+
+    for a short product name or abbreviation.
+    """
+
+    text = normalize_message(message)
+
+    if not text:
+        return False
+
+    # --------------------------------------------------------
+    # Known greetings should NOT become product searches
+    # --------------------------------------------------------
+
+    greetings = {
+        "hi",
+        "hello",
+        "hey",
+        "hii",
+        "hiii",
+        "helo",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "good night",
+    }
+
+    if text in greetings:
+        return False
+
+    # --------------------------------------------------------
+    # Known casual messages should NOT become product searches
+    # --------------------------------------------------------
+
+    casual_messages = {
+        "thanks",
+        "thank you",
+        "thankyou",
+        "bye",
+        "goodbye",
+        "how are you",
+        "how are ypu",
+        "how are u",
+        "how r you",
+        "how r u",
+        "who are you",
+        "what are you",
+        "what are you doing",
+        "nice",
+    }
+
+    if text in casual_messages:
+        return False
+
+    # --------------------------------------------------------
+    # Technical/general questions should NOT be treated as
+    # simple product searches.
+    # --------------------------------------------------------
+
+    technical_starters = (
+        "what is ",
+        "what are ",
+        "how much ",
+        "how many ",
+        "when should ",
+        "why ",
+        "where should ",
+        "how do ",
+        "how can ",
+        "tell me about ",
+        "explain ",
+        "what does ",
+        "can you explain ",
     )
+
+    if text.startswith(technical_starters):
+        return False
+
+    # --------------------------------------------------------
+    # Very short single-word input
+    # --------------------------------------------------------
+    #
+    # Examples:
+    #
+    # VMA
+    # vma
+    # powder
+    # powdar
+    # plast
+    # seal
+    #
+    # These should be allowed to reach Python search.
+    # --------------------------------------------------------
+
+    words = text.split()
+
+    if len(words) == 1:
+
+        # If it is a short word consisting mostly of letters/numbers,
+        # consider it a possible product search.
+        #
+        # We deliberately allow unknown words here.
+        # The Excel dataset decides whether a product exists.
+        if re.fullmatch(r"[a-z0-9]+", text):
+
+            return True
+
+    return False
 
 
 # ============================================================
@@ -26,6 +199,24 @@ def get_ai_client():
 # ============================================================
 
 def analyze_user_message(message):
+    """
+    Understand the user's message.
+
+    Gemini is used to understand natural-language requests.
+
+    IMPORTANT:
+    Gemini does NOT decide whether a product exists.
+
+    Python + Excel are responsible for checking the actual
+    product database.
+
+    Supported intents:
+
+        greeting
+        product_search
+        casual
+        invalid
+    """
 
     if not isinstance(message, str):
         message = ""
@@ -33,7 +224,6 @@ def analyze_user_message(message):
     message = message.strip()
 
     if not message:
-
         return {
             "intent": "invalid",
             "search_query": "",
@@ -41,13 +231,39 @@ def analyze_user_message(message):
             "reason": "Empty message."
         }
 
+    normalized_message = normalize_message(message)
 
     # ========================================================
-    # CREATE GEMINI CLIENT
+    # LOCAL CHECK — SIMPLE PRODUCT SEARCH
+    # ========================================================
+    #
+    # This is the main fix for:
+    #
+    #     VMA
+    #     vma
+    #     powder
+    #     powdar
+    #     plast
+    #
+    # We do not need Gemini to classify these.
+    # ========================================================
+
+    if is_simple_product_candidate(message):
+
+        return {
+            "intent": "product_search",
+            "search_query": message,
+            "confidence": 1.0,
+            "reason": (
+                "Simple product-search candidate detected locally."
+            )
+        }
+
+    # ========================================================
+    # GEMINI CLIENT
     # ========================================================
 
     client = get_ai_client()
-
 
     if client is None:
 
@@ -60,35 +276,201 @@ def analyze_user_message(message):
             )
         }
 
-
     # ========================================================
-    # SYSTEM INSTRUCTION
+    # GEMINI PROMPT
     # ========================================================
 
     prompt = f"""
-You are the AI message understanding system for a
-Hindcon Product Assistant.
+You are the message understanding system for a Hindcon
+Product Assistant.
 
-The application is used ONLY for finding Hindcon products
-and their TDS/MSDS document links.
+The application is used ONLY for:
 
-Your job is to UNDERSTAND and CLASSIFY the user's message.
+1. Finding Hindcon products.
+2. Finding the TDS document link for a product.
+3. Finding the MSDS document link for a product.
 
-You must NOT answer the user's question.
+You must NOT answer technical questions.
 
-You must NOT provide technical TDS information.
+You must NOT invent product information.
 
-You must NOT invent any product information.
+You must NOT invent TDS or MSDS information.
 
-Choose exactly ONE of these intents:
+Python will search the Excel database for the actual product.
 
-------------------------------------------------------------
-INTENT 1: greeting
-------------------------------------------------------------
+Your job is ONLY to classify the user's message and,
+when appropriate, extract the product search phrase.
 
-Use "greeting" when the user is greeting the assistant.
+============================================================
+IMPORTANT PRODUCT SEARCH RULE
+============================================================
+
+If the user appears to be looking for a Hindcon product,
+classify the message as:
+
+product_search
+
+This includes:
+
+- Complete product names
+- Partial product names
+- Product abbreviations
+- Product codes
+- Product-name fragments
+- Possible spelling mistakes
+- Short unknown words that could be product names
 
 Examples:
+
+VMA
+vma
+powder
+powdar
+plast
+hind
+seal
+crystel
+crystal
+proof
+plug
+sca
+wp
+
+These should be treated as possible product searches.
+
+DO NOT classify a short unknown word as invalid just because
+you do not recognize it.
+
+Python will determine whether the product actually exists.
+
+============================================================
+PRODUCT SEARCH EXAMPLES
+============================================================
+
+User:
+Hind Crystel Seal
+
+intent:
+product_search
+
+search_query:
+Hind Crystel Seal
+
+
+User:
+hind crystel sel
+
+intent:
+product_search
+
+search_query:
+hind crystel sel
+
+
+User:
+Give me the TDS of Hind Crystel Seal
+
+intent:
+product_search
+
+search_query:
+Hind Crystel Seal
+
+
+User:
+I need the MSDS of Hind Fix TA
+
+intent:
+product_search
+
+search_query:
+Hind Fix TA
+
+
+User:
+show me Hind Sol SR
+
+intent:
+product_search
+
+search_query:
+Hind Sol SR
+
+
+User:
+Hind Plast N
+
+intent:
+product_search
+
+search_query:
+Hind Plast N
+
+
+User:
+hind plast
+
+intent:
+product_search
+
+search_query:
+hind plast
+
+
+User:
+hind
+
+intent:
+product_search
+
+search_query:
+hind
+
+
+User:
+VMA
+
+intent:
+product_search
+
+search_query:
+VMA
+
+
+User:
+vma
+
+intent:
+product_search
+
+search_query:
+vma
+
+
+User:
+powdar
+
+intent:
+product_search
+
+search_query:
+powdar
+
+
+User:
+powder
+
+intent:
+product_search
+
+search_query:
+powder
+
+============================================================
+GREETING
+============================================================
+
+Classify these as greeting:
 
 hi
 hello
@@ -101,94 +483,21 @@ good afternoon
 good evening
 good night
 
+For greeting:
 
-------------------------------------------------------------
-INTENT 2: product_search
-------------------------------------------------------------
+search_query must be empty.
 
-Use "product_search" when the user wants to find a Hindcon
-product or wants its TDS/MSDS document.
+============================================================
+CASUAL
+============================================================
 
-Examples:
-
-Hind
-hind plast
-Hind Sol SR
-Hind Fix TA
-Hind Crystel Seal
-show Hind
-show Hind products
-show me Hind Sol SR
-find Hind Fix TA
-I want Hind Crystel Seal
-Give me the TDS of Hind Crystel Seal
-Give me the MSDS of Hind Fix TA
-I need the TDS of Hind Sol SR
-hind crystel sel
-
-
-IMPORTANT:
-
-For product_search, extract ONLY the product name or
-product search phrase.
-
-Example:
-
-User:
-Give me the TDS of Hind Crystel Seal
-
-search_query:
-Hind Crystel Seal
-
-
-User:
-I need the MSDS of Hind Fix TA
-
-search_query:
-Hind Fix TA
-
-
-User:
-show me Hind Sol SR
-
-search_query:
-Hind Sol SR
-
-
-User:
-hind plast
-
-search_query:
-hind plast
-
-
-User:
-hind
-
-search_query:
-hind
-
-
-User:
-hind crystel sel
-
-search_query:
-hind crystel sel
-
-
-------------------------------------------------------------
-INTENT 3: casual
-------------------------------------------------------------
-
-Use "casual" for normal conversation that is not a
-product search.
-
-Examples:
+Classify these as casual:
 
 how are you
 how are ypu
 how are u
 how r you
+how r u
 thanks
 thank you
 bye
@@ -198,92 +507,83 @@ what are you
 what are you doing
 nice
 
+For casual:
 
-------------------------------------------------------------
-INTENT 4: invalid
-------------------------------------------------------------
+search_query must be empty.
 
-Use "invalid" when the user asks something unrelated to
-Hindcon products or TDS/MSDS.
+============================================================
+INVALID
+============================================================
 
-Examples:
-
-what is the date of today?
-what is today's date?
-what is the weather today?
-what is the weather?
-what time is it?
-tell me a joke
-solve 2 + 2
-solve this math problem
-who won the cricket match?
-who won the football match?
-what is the capital of India?
-write python code
-write a program
-who is the prime minister?
-
-
-IMPORTANT RULES:
-
-- Date questions = invalid
-- Weather questions = invalid
-- Time questions = invalid
-- Cricket questions = invalid
-- Football questions = invalid
-- Mathematics questions = invalid
-- Programming questions = invalid
-- General knowledge questions = invalid
-- Jokes = invalid
-
-Only Hindcon product/TDS/MSDS requests are
-product_search.
-
-
-------------------------------------------------------------
-VERY IMPORTANT
-------------------------------------------------------------
-
-If the user writes only a word or short phrase that looks
-like a Hindcon product search, classify it as product_search.
+Invalid means the user is clearly asking about something
+outside the Hindcon product/document search system.
 
 Examples:
 
-Hind
-Hind plast
-Hind sol
-Hind fix
-Hind seal
-Hind plug
+What is today's weather?
+What is today's date?
+Who is the Prime Minister?
+Tell me a joke.
+Solve this mathematics problem.
+Write Python code.
+What happened in cricket today?
+What is football?
+What is artificial intelligence?
 
+For invalid:
 
-------------------------------------------------------------
-OUTPUT
-------------------------------------------------------------
+search_query must be empty.
 
-Return ONLY JSON.
+============================================================
+TECHNICAL TDS QUESTIONS
+============================================================
 
-The JSON must have exactly these fields:
+The current application does NOT answer technical questions.
+
+Examples:
+
+What is the setting time of Hind Plug - S?
+What is the coverage of Hind Crystel Seal?
+What is the shelf life of Hind Powder WP?
+What is the density of Hind Fix TA?
+How do I apply Hind Crystel Seal?
+
+These should NOT be answered by Gemini.
+
+However, if the user clearly mentions a product and asks for
+its TDS/MSDS document, classify it as product_search.
+
+Example:
+
+Give me the TDS of Hind Crystel Seal
+
+product_search
+
+search_query:
+Hind Crystel Seal
+
+============================================================
+IMPORTANT
+============================================================
+
+Never invent a product name.
+
+Never answer the user's question.
+
+Only return the classification and extracted search phrase.
+
+Return ONLY valid JSON.
+
+Required fields:
 
 intent
 search_query
 confidence
 reason
 
-Example:
-
-{{
-    "intent": "product_search",
-    "search_query": "Hind Crystel Seal",
-    "confidence": 0.98,
-    "reason": "The user wants to find a Hindcon product."
-}}
-
 User message:
-
 {message}
 """
-
 
     # ========================================================
     # CALL GEMINI
@@ -292,23 +592,19 @@ User message:
     try:
 
         response = client.models.generate_content(
-
-            model="gemini-3.1-flash-lite",
-
+            model="gemini-3.6-flash",
             contents=prompt,
-
             config=types.GenerateContentConfig(
-
-                temperature=0,
-
                 response_mime_type="application/json",
 
                 response_schema={
                     "type": "OBJECT",
+
                     "properties": {
 
                         "intent": {
                             "type": "STRING",
+
                             "enum": [
                                 "greeting",
                                 "product_search",
@@ -328,7 +624,6 @@ User message:
                         "reason": {
                             "type": "STRING"
                         }
-
                     },
 
                     "required": [
@@ -341,13 +636,7 @@ User message:
             )
         )
 
-
-        # ====================================================
-        # READ GEMINI RESPONSE
-        # ====================================================
-
         response_text = response.text.strip()
-
 
         if not response_text:
 
@@ -360,44 +649,11 @@ User message:
                 )
             }
 
+        result = json.loads(response_text)
 
-        # ====================================================
-        # CONVERT JSON
-        # ====================================================
-
-        result = json.loads(
-            response_text
-        )
-
-
-        # ====================================================
-        # GET VALUES
-        # ====================================================
-
-        intent = result.get(
-            "intent",
-            "invalid"
-        )
-
-        search_query = result.get(
-            "search_query",
-            ""
-        )
-
-        confidence = result.get(
-            "confidence",
-            0.0
-        )
-
-        reason = result.get(
-            "reason",
-            "Gemini analyzed the message."
-        )
-
-
-        # ====================================================
-        # VALIDATE INTENT
-        # ====================================================
+        # ----------------------------------------------------
+        # Validate intent
+        # ----------------------------------------------------
 
         valid_intents = {
             "greeting",
@@ -406,89 +662,83 @@ User message:
             "invalid"
         }
 
+        intent = result.get(
+            "intent",
+            "invalid"
+        )
 
         if intent not in valid_intents:
 
             intent = "invalid"
 
+        # ----------------------------------------------------
+        # Get search query
+        # ----------------------------------------------------
 
-        # ====================================================
-        # CLEAN SEARCH QUERY
-        # ====================================================
+        search_query = result.get(
+            "search_query",
+            ""
+        )
 
-        if not isinstance(
-            search_query,
-            str
-        ):
+        if not isinstance(search_query, str):
 
             search_query = ""
 
-
         search_query = search_query.strip()
 
+        # ----------------------------------------------------
+        # Safety fallback
+        # ----------------------------------------------------
+        #
+        # If Gemini says product_search but doesn't provide
+        # a query, use the original user message.
+        # ----------------------------------------------------
 
-        # ====================================================
-        # PRODUCT SEARCH FALLBACK
-        # ========================================================
-
-        if (
-            intent == "product_search"
-            and not search_query
-        ):
+        if intent == "product_search" and not search_query:
 
             search_query = message
 
+        # ----------------------------------------------------
+        # Confidence
+        # ----------------------------------------------------
 
-        # ====================================================
-        # CONFIDENCE
-        # ========================================================
+        confidence = result.get(
+            "confidence",
+            0.0
+        )
 
         try:
 
-            confidence = float(
-                confidence
-            )
+            confidence = float(confidence)
 
-        except (
-            TypeError,
-            ValueError
-        ):
+        except (TypeError, ValueError):
 
             confidence = 0.0
 
-
         confidence = max(
             0.0,
-            min(
-                1.0,
-                confidence
-            )
+            min(1.0, confidence)
         )
-
-
-        # ====================================================
-        # RETURN RESULT
-        # ========================================================
 
         return {
             "intent": intent,
             "search_query": search_query,
             "confidence": confidence,
-            "reason": reason
+            "reason": result.get(
+                "reason",
+                "Gemini analyzed the message."
+            )
         }
 
-
-    # ========================================================
-    # GEMINI ERROR
-    # ========================================================
-
     except Exception as error:
+
+        # Print the real error in PowerShell so it can be
+        # diagnosed if Gemini has a quota/API/model problem.
 
         print(
             "Gemini error:",
             error
         )
-
 
         return {
             "intent": "error",
@@ -501,34 +751,70 @@ User message:
 
 
 # ============================================================
-# MAIN RESPONSE HANDLER
+# MAIN AI RESPONSE
 # ============================================================
 
 def get_ai_response(message):
+    """
+    Convert the user's message into an application action.
 
-    result = analyze_user_message(
-        message
-    )
+    Possible response types:
 
+        text
+        product_search
+    """
+
+    result = analyze_user_message(message)
 
     intent = result["intent"]
 
-
     # ========================================================
-    # GEMINI ERROR
+    # GEMINI/API ERROR
     # ========================================================
 
     if intent == "error":
 
+        # ----------------------------------------------------
+        # IMPORTANT FALLBACK
+        # ----------------------------------------------------
+        #
+        # Even if Gemini is unavailable, a simple product-like
+        # search should still work.
+        #
+        # Example:
+        #
+        # Gemini quota exhausted
+        # User: VMA
+        #
+        # We can still search Excel.
+        # ----------------------------------------------------
+
+        if is_simple_product_candidate(message):
+
+            return {
+                "type": "product_search",
+                "search_query": message,
+                "analysis": {
+                    **result,
+                    "intent": "product_search",
+                    "search_query": message,
+                    "reason": (
+                        "Gemini unavailable; "
+                        "local product-search fallback used."
+                    )
+                }
+            }
+
         return {
             "type": "text",
+
             "message": (
                 "Sorry, I am temporarily unable to "
                 "understand your request. Please try again."
             ),
+
             "analysis": result
         }
-
 
     # ========================================================
     # GREETING
@@ -538,12 +824,13 @@ def get_ai_response(message):
 
         return {
             "type": "text",
+
             "message": (
                 "Hello! How can I help you today?"
             ),
+
             "analysis": result
         }
-
 
     # ========================================================
     # CASUAL
@@ -551,8 +838,11 @@ def get_ai_response(message):
 
     if intent == "casual":
 
-        normalized = message.lower().strip()
+        normalized = normalize_message(message)
 
+        # ----------------------------------------------------
+        # THANK YOU
+        # ----------------------------------------------------
 
         if normalized in {
             "thanks",
@@ -565,6 +855,9 @@ def get_ai_response(message):
                 "How can I help you find a Hindcon product?"
             )
 
+        # ----------------------------------------------------
+        # GOODBYE
+        # ----------------------------------------------------
 
         elif normalized in {
             "bye",
@@ -575,6 +868,9 @@ def get_ai_response(message):
                 "Goodbye! Have a great day."
             )
 
+        # ----------------------------------------------------
+        # HOW ARE YOU
+        # ----------------------------------------------------
 
         elif normalized in {
             "how are you",
@@ -589,6 +885,9 @@ def get_ai_response(message):
                 "How can I help you find a Hindcon product?"
             )
 
+        # ----------------------------------------------------
+        # WHO ARE YOU
+        # ----------------------------------------------------
 
         elif normalized in {
             "who are you",
@@ -601,6 +900,9 @@ def get_ai_response(message):
                 "and their TDS/MSDS documents."
             )
 
+        # ----------------------------------------------------
+        # OTHER CASUAL MESSAGE
+        # ----------------------------------------------------
 
         else:
 
@@ -609,13 +911,11 @@ def get_ai_response(message):
                 "and their TDS/MSDS documents."
             )
 
-
         return {
             "type": "text",
             "message": response,
             "analysis": result
         }
-
 
     # ========================================================
     # INVALID
@@ -625,13 +925,14 @@ def get_ai_response(message):
 
         return {
             "type": "text",
+
             "message": (
                 "Sorry, I can only help you search for "
                 "Hindcon products and their TDS/MSDS documents."
             ),
+
             "analysis": result
         }
-
 
     # ========================================================
     # PRODUCT SEARCH
@@ -641,12 +942,11 @@ def get_ai_response(message):
 
         return {
             "type": "product_search",
-            "search_query": result[
-                "search_query"
-            ],
+
+            "search_query": result["search_query"],
+
             "analysis": result
         }
-
 
     # ========================================================
     # FINAL FALLBACK
@@ -654,8 +954,10 @@ def get_ai_response(message):
 
     return {
         "type": "text",
+
         "message": (
             "Sorry, I could not understand your request."
         ),
+
         "analysis": result
     }
