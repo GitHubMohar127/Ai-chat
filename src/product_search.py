@@ -922,4 +922,4 @@ def search_products(
             "_match_score"
         ],
         errors="ignore"
-    ).reset_index(drop=True)
+    ).reset_index(drop=True)  
