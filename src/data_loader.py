@@ -6,7 +6,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Dataset location
-DATASET_PATH = PROJECT_ROOT / "data" / "TDS.xlsx"
+DATASET_PATH = PROJECT_ROOT / "data" / "All_Products_TDS_MSDS (2).xlsx"
 
 
 def load_product_data():
@@ -17,7 +17,7 @@ def load_product_data():
     if not DATASET_PATH.exists():
         raise FileNotFoundError(
             f"Dataset not found: {DATASET_PATH}"
-        )
+        ) 
 
     df = pd.read_excel(DATASET_PATH)
 

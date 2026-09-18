@@ -567,7 +567,7 @@ def search_products(
 
     For short queries, a stricter matching rule is used.
     """
-
+  
     # ========================================================
     # STEP 1 — Validate input
     # ========================================================
@@ -830,7 +830,7 @@ def search_products(
 
     # ========================================================
     # STEP 7 — Full-name fuzzy matching
-    # ========================================================
+    # ======================================================== 
 
     fuzzy_matches = []
 
@@ -922,4 +922,310 @@ def search_products(
             "_match_score"
         ],
         errors="ignore"
-    ).reset_index(drop=True)  
+    ).reset_index(drop=True)
+
+# ============================================================
+# CATEGORY SEARCH SUPPORT
+# ============================================================
+
+def _split_categories(category_value):
+    """
+    Convert a Category cell into individual category names.
+
+    This handles datasets where multiple categories are stored:
+
+        in separate rows, or
+        inside one cell separated by commas, semicolons, |, /, or new lines.
+    """
+
+    if category_value is None or pd.isna(category_value):
+        return []
+
+    text = str(category_value).strip()
+
+    if not text:
+        return []
+
+    parts = re.split(r"[,;|/\n]+", text)
+
+    categories = []
+
+    for part in parts:
+        part = part.strip()
+        if part:
+            categories.append(part)
+
+    return categories
+
+
+def calculate_category_score(query, category):
+    """
+    Calculate the similarity between a user category search and
+    one category name.
+
+    Supports:
+        - exact category matching
+        - partial category matching
+        - word matching
+        - spelling mistakes
+
+    Examples:
+        "Waterproofing Compounds"
+        "waterproofing"
+        "waterprofing"
+    """
+
+    query_normalized = normalize_text(query)
+    category_normalized = normalize_text(category)
+
+    if not query_normalized or not category_normalized:
+        return 0
+
+    if query_normalized == category_normalized:
+        return 100
+
+    if query_normalized in category_normalized:
+        return 96
+
+    if category_normalized in query_normalized:
+        return 94
+
+    query_words = get_words(query_normalized)
+    category_words = get_words(category_normalized)
+
+    if not query_words or not category_words:
+        return 0
+
+    word_scores = []
+
+    for query_word in query_words:
+        best_score = 0
+
+        for category_word in category_words:
+            score = calculate_word_score(
+                query_word,
+                category_word
+            )
+            best_score = max(best_score, score)
+
+        word_scores.append(best_score)
+
+    if not word_scores:
+        return 0
+
+    average_score = sum(word_scores) / len(word_scores)
+    minimum_score = min(word_scores)
+
+    full_score = max(
+        fuzz.ratio(query_normalized, category_normalized),
+        fuzz.partial_ratio(query_normalized, category_normalized),
+        fuzz.token_set_ratio(query_normalized, category_normalized)
+    )
+
+    return max(
+        full_score,
+        average_score * 0.65 + minimum_score * 0.35
+    )
+
+
+def _clean_category_results(results):
+    """
+    Deduplicate category results by product.
+
+    A product may belong to more than one category, so the same
+    product can occur on multiple rows. It must appear only once
+    in the final category result.
+
+    When duplicate rows exist, TDS/MSDS links are preserved if
+    they are available on any row for that product.
+    """
+
+    if results is None or results.empty:
+        return pd.DataFrame()
+
+    results = results.copy()
+
+    if "Product_Name" not in results.columns:
+        return results.reset_index(drop=True)
+
+    results["Product_Name"] = (
+        results["Product_Name"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    results = results[results["Product_Name"] != ""].copy()
+
+    if results.empty:
+        return results.reset_index(drop=True)
+
+    # Use Product_ID when available because the same product name
+    # can legitimately appear with different IDs in some datasets.
+    if "Product_ID" in results.columns:
+        group_columns = ["Product_ID"]
+    else:
+        group_columns = ["Product_Name"]
+
+    output_rows = []
+
+    for _, group in results.groupby(
+        group_columns,
+        sort=False,
+        dropna=False
+    ):
+        first_row = group.iloc[0].copy()
+
+        # Combine categories without duplicates.
+        if "Category" in group.columns:
+            all_categories = []
+
+            for value in group["Category"].tolist():
+                for category in _split_categories(value):
+                    if normalize_text(category) not in {
+                        normalize_text(x) for x in all_categories
+                    }:
+                        all_categories.append(category)
+
+            first_row["Category"] = ", ".join(all_categories)
+
+        # Preserve the first available TDS link.
+        if "TDS_Link" in group.columns:
+            for value in group["TDS_Link"].tolist():
+                if pd.notna(value) and str(value).strip().lower() not in {"", "nan", "none"}:
+                    first_row["TDS_Link"] = str(value).strip()
+                    break
+
+        # Preserve the first available MSDS link.
+        if "MSDS_Link" in group.columns:
+            for value in group["MSDS_Link"].tolist():
+                if pd.notna(value) and str(value).strip().lower() not in {"", "nan", "none"}:
+                    first_row["MSDS_Link"] = str(value).strip()
+                    break
+
+        output_rows.append(first_row)
+
+    return pd.DataFrame(output_rows, columns=results.columns).reset_index(drop=True)
+
+
+def search_categories(df, query, fuzzy_threshold=78):
+    """
+    Search the Hindcon dataset by category name.
+
+    This is separate from search_products() so product-name search
+    behavior remains unchanged.
+
+    The function supports:
+        - exact category names
+        - partial category names
+        - spelling mistakes
+        - multiple categories per product
+        - multiple category rows for the same product
+
+    Example:
+
+        search_categories(df, "Waterproofing Compounds")
+
+    returns every product belonging to that category, with its
+    Product_Name, TDS_Link and MSDS_Link.
+
+    If one product belongs to multiple categories, it is returned
+    only once.
+    """
+
+    if df is None or df.empty:
+        return pd.DataFrame(columns=df.columns if df is not None else [])
+
+    if not isinstance(query, str):
+        return pd.DataFrame(columns=df.columns)
+
+    query = query.strip()
+
+    if not query or "Category" not in df.columns:
+        return pd.DataFrame(columns=df.columns)
+
+    matches = []
+
+    for index, row in df.iterrows():
+        categories = _split_categories(row.get("Category", ""))
+
+        best_score = 0
+        best_category = ""
+
+        for category in categories:
+            score = calculate_category_score(query, category)
+
+            if score > best_score:
+                best_score = score
+                best_category = category
+
+        # Use a slightly stricter threshold for very short searches.
+        normalized_query = normalize_text(query)
+
+        if len(normalized_query) <= 3:
+            required_score = 94
+        elif len(normalized_query) <= 5:
+            required_score = 88
+        else:
+            required_score = fuzzy_threshold
+
+        if best_score >= required_score:
+            matches.append(
+                {
+                    "index": index,
+                    "score": best_score,
+                    "matched_category": best_category
+                }
+            )
+
+    if not matches:
+        return pd.DataFrame(columns=df.columns)
+
+    matches.sort(
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    matched_indexes = [item["index"] for item in matches]
+    result = df.loc[matched_indexes].copy()
+
+    # Add internal category match score only temporarily.
+    score_map = {
+        item["index"]: item["score"]
+        for item in matches
+    }
+
+    result["_category_match_score"] = result.index.map(score_map)
+    result = result.sort_values(
+        by="_category_match_score",
+        ascending=False
+    )
+
+    result = result.drop(
+        columns=["_category_match_score"],
+        errors="ignore"
+    )
+
+    # Critical: one product = one result, even when the product has
+    # multiple categories or multiple rows in the Excel file.
+    result = _clean_category_results(result)
+
+    return result
+
+
+def is_category_search(df, query, fuzzy_threshold=78):
+    """
+    Return True when the query matches at least one category.
+
+    This can be used by app.py to decide whether to run a category
+    search before a normal product-name search.
+    """
+
+    results = search_categories(
+        df,
+        query,
+        fuzzy_threshold=fuzzy_threshold
+    )
+
+    return not results.empty
+
